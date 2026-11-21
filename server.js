@@ -13,7 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const knowledgeDirectory = resolve(here, 'data');
 const app = express();
 const port = Number(process.env.PORT || 3001);
-const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const model = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 const embeddingModel = process.env.EMBEDDING_MODEL || 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 const origins = (process.env.ALLOWED_ORIGINS || '*').split(',').map((x) => x.trim()).filter(Boolean);
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
