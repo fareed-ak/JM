@@ -3,16 +3,18 @@ import cors from 'cors';
 import express from 'express';
 import { rateLimit } from 'express-rate-limit';
 import Groq from 'groq-sdk';
+import { pipeline } from '@huggingface/transformers';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const projectRoot = resolve(here, '..');
+const knowledgeDirectory = resolve(here, 'data');
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const embeddingModel = process.env.EMBEDDING_MODEL || 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 const origins = (process.env.ALLOWED_ORIGINS || '*').split(',').map((x) => x.trim()).filter(Boolean);
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
@@ -57,7 +59,7 @@ function readKnowledgeBase() {
   const docs = [];
   for (const [file, label] of files) {
     try {
-      const modulePath = resolve(projectRoot, 'constants', file);
+      const modulePath = resolve(knowledgeDirectory, file);
       const source = readFileSync(modulePath, 'utf8');
       const keys = [...source.matchAll(/^export\s+const\s+(\w+)\s*=/gm)].map((match) => match[1]);
       const executable = source.replace(/^export\s+const\s+/gm, 'const ') +
@@ -78,8 +80,11 @@ function readKnowledgeBase() {
 }
 
 const documents = readKnowledgeBase();
+let embedder = null;
+let documentEmbeddings = [];
+let embeddingStatus = 'loading';
 const tokenize = (text) => text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
-function retrieve(question, limit = 5) {
+function lexicalRetrieve(question, limit = 5) {
   const query = new Set(tokenize(question));
   const scored = documents.map((doc) => {
     const terms = tokenize(doc.text);
@@ -94,33 +99,85 @@ function retrieve(question, limit = 5) {
   return scored.filter((doc) => doc.score > 0).sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
+const cosineSimilarity = (a, b) => {
+  let dot = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i += 1) dot += a[i] * b[i];
+  return dot;
+};
+
+async function embed(texts) {
+  const output = await embedder(texts, { pooling: 'mean', normalize: true });
+  const rows = output.tolist();
+  return Array.isArray(rows[0]) ? rows : [rows];
+}
+
+async function buildEmbeddings() {
+  if (!documents.length) {
+    embeddingStatus = 'no_documents';
+    return;
+  }
+  try {
+    console.log(`Loading multilingual embedding model ${embeddingModel}`);
+    embedder = await pipeline('feature-extraction', embeddingModel);
+    documentEmbeddings = [];
+    for (let i = 0; i < documents.length; i += 16) {
+      const batch = documents.slice(i, i + 16);
+      documentEmbeddings.push(...await embed(batch.map((doc) => doc.text)));
+    }
+    embeddingStatus = 'ready';
+    console.log(`Built ${documentEmbeddings.length} document embeddings`);
+  } catch (error) {
+    embeddingStatus = 'unavailable';
+    embedder = null;
+    console.error('Embedding model unavailable; using lexical retrieval:', error.message);
+  }
+}
+
+async function retrieve(question, limit = 5) {
+  if (embedder && documentEmbeddings.length === documents.length) {
+    try {
+      const [queryVector] = await embed([question]);
+      return documents
+        .map((doc, index) => ({ ...doc, score: cosineSimilarity(queryVector, documentEmbeddings[index]) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+    } catch (error) {
+      console.error('Query embedding failed; using lexical retrieval:', error.message);
+    }
+  }
+  return lexicalRetrieve(question, limit);
+}
+
 app.get('/', (_req, res) => res.json({ status: 'ok', service: 'jagruk-mahila-rag' }));
-app.get('/health', (_req, res) => res.json({ status: 'ok', indexedDocuments: documents.length }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', indexedDocuments: documents.length, embeddingStatus, embeddedDocuments: documentEmbeddings.length }));
 app.post('/chat', async (req, res) => {
   const question = req.body?.question;
   if (typeof question !== 'string' || !question.trim() || question.length > 4000) {
     return res.status(400).json({ errorCode: 'bad_request', error: 'Please provide a question under 4,000 characters.' });
   }
   if (!groq) return res.status(503).json({ errorCode: 'service_unavailable', error: 'The chat service is not configured.' });
-  const sources = retrieve(question.trim());
-  if (!sources.length) return res.json({ answer: 'I could not find relevant information in the app’s current legal awareness content. Please try asking in another way or consult a qualified legal professional.' });
+  const sources = await retrieve(question.trim());
   try {
     const completion = await groq.chat.completions.create({
       model,
       temperature: 0.2,
       max_tokens: 900,
       messages: [
-        { role: 'system', content: 'You are Jagruk Mahila, a legal-awareness assistant for women in India. Answer in the language used by the user. Use only the supplied app context; do not invent laws, deadlines, rights, or procedures. If context is insufficient, say so. Give clear, supportive general information, not individualized legal advice. For immediate danger, say to call 112. Finish with a brief reminder that this is awareness information, not legal advice.' },
-        { role: 'user', content: `Question:\n${question.trim()}\n\nRetrieved app context:\n${sources.map((s, i) => `[${i + 1}] ${s.source}: ${s.text}`).join('\n\n')}` },
+        { role: 'system', content: 'You are Jagruk Mahila, a legal-awareness assistant for women in India. Answer in the language used by the user. Prefer the supplied app context and clearly say when it does not cover the question. If no context is supplied, provide cautious general legal-awareness information based on your knowledge and explicitly say the app sources did not cover it; do not invent specific laws, deadlines, rights, or procedures. For immediate danger, say to call 112. Do not claim to be a lawyer or provide individualized legal advice. Finish with a brief reminder to verify important legal information with an authoritative source or qualified professional.' },
+        { role: 'user', content: `Question:\n${question.trim()}\n\nRetrieved app context:\n${sources.length ? sources.map((s, i) => `[${i + 1}] ${s.source}: ${s.text}`).join('\n\n') : '[No relevant passage was retrieved from the app knowledge base. Answer the user cautiously without claiming that the app provided supporting source material.]'}` },
       ],
     });
     const answer = completion.choices[0]?.message?.content?.trim();
     if (!answer) throw new Error('Model returned an empty answer');
-    return res.json({ answer: `${answer}\n\nSources: ${[...new Set(sources.map((s) => s.source))].join(', ')}` });
+    const sourceLine = sources.length ? `\n\nApp sources: ${[...new Set(sources.map((s) => s.source))].join(', ')}` : '\n\nNote: No relevant app source was retrieved; verify this general information with an authoritative source.';
+    return res.json({ answer: `${answer}${sourceLine}` });
   } catch (error) {
     console.error('Groq request failed:', error.message);
     return res.status(502).json({ errorCode: 'service_unavailable', error: 'The chat service is not available right now.' });
   }
 });
 
-app.listen(port, '0.0.0.0', () => console.log(`Jagruk Mahila RAG listening on port ${port}; indexed ${documents.length} passages`));
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Jagruk Mahila RAG listening on port ${port}; indexed ${documents.length} passages`);
+  buildEmbeddings();
+});
